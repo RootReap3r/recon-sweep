@@ -194,3 +194,16 @@ the current NIST AI RMF 1.0 before citing in a formal report.*
 ## License
 
 Apache-2.0. See [LICENSE](./LICENSE).
+
+---
+
+## Lineage
+
+recon-sweep is the proving ground for **Nemesis** — its precursor prototype.
+The core doctrine matured here: falsifiable ground-truth gates over LLM
+self-scoring, scope-as-authorization encoded in software, advisory-vs-gating
+signal separation. Nemesis carries these forward at greater scale and
+capability; recon-sweep is where they were first shown to hold.
+
+Think Anakin before the suit — same instincts, earlier form. Everything
+Nemesis does at scale, recon-sweep did first as a single-file harness.
