@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -117,8 +118,58 @@ class Scope:
             )
 
 
+    def connection_address(self, host: str) -> str:
+        """Resolve once, authorize every answer, and connect to the vetted IP."""
+        host = host.lower().rstrip('.')
+        entries = {v.lower().rstrip('.') for v in self.allow}
+        try:
+            addresses = list(dict.fromkeys(info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)))
+        except socket.gaierror as exc:
+            raise ScopeError(f"Cannot resolve {host}") from exc
+        if not addresses:
+            raise ScopeError("No target address")
+        if host not in entries:
+            networks = []
+            for entry in entries:
+                try: networks.append(ipaddress.ip_network(entry, strict=False))
+                except ValueError: pass
+            if not all(any(ipaddress.ip_address(addr) in net for net in networks) for addr in addresses):
+                raise ScopeError(f"{host} resolves outside the allowlist")
+        return addresses[0]
+
+    def request(self, method: str, url: str, **kwargs):
+        """No automatic redirects, proxy routing, netrc credentials or DNS rebind."""
+        host = _host_of(url)
+        address = self.connection_address(host)
+        parts = urlsplit(url)
+        port = parts.port
+        authority = f"[{address}]" if ':' in address else address
+        if port: authority += f":{port}"
+        pinned_url = urlunsplit((parts.scheme, authority, parts.path, parts.query, ''))
+        headers = dict(kwargs.pop('headers', {}) or {})
+        for key in list(headers):
+            if key.lower() == 'host': del headers[key]
+        headers['Host'] = parts.netloc
+        kwargs['allow_redirects'] = False
+        kwargs['verify'] = True
+        with requests.Session() as session:
+            session.trust_env = False
+            if parts.scheme == 'https':
+                class PinnedTLS(requests.adapters.HTTPAdapter):
+                    def init_poolmanager(self, *args, **options):
+                        options.update(assert_hostname=host, server_hostname=host)
+                        return super().init_poolmanager(*args, **options)
+                session.mount('https://', PinnedTLS())
+            return session.request(method, pinned_url, headers=headers, **kwargs)
+
+
 def _host_of(url: str) -> str:
-    return url.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
+        raise ScopeError("Expected an HTTP(S) URL without user information")
+    # Validate the port as well, including malformed bracket/port syntax.
+    _ = parts.port
+    return parts.hostname.lower().rstrip(".")
 
 
 # ~200 common paths — feroxbuster-style seclist subset. Read-only GET probes.
@@ -356,7 +407,7 @@ class NativeScanner:
     def web_fingerprint(self, url: str) -> dict:
         self.scope.assert_in_scope(_host_of(url))
         try:
-            r = requests.get(url, timeout=5, verify=False, allow_redirects=True)
+            r = self.scope.request("GET", url, timeout=5, allow_redirects=False)
         except requests.RequestException as e:
             return {"error": str(e)}
         html = (r.text or "")[:5000]
@@ -375,7 +426,7 @@ class NativeScanner:
 
         def check(path: str) -> Optional[dict]:
             try:
-                r = requests.get(f"{base}/{path}", timeout=3, allow_redirects=False)
+                r = self.scope.request("GET", f"{base}/{path}", timeout=3, allow_redirects=False)
                 if r.status_code in (200, 301, 302, 401, 403):
                     return {"path": path, "status": r.status_code, "size": len(r.content)}
             except requests.RequestException:
@@ -417,7 +468,7 @@ class ReconKit:
                            ("models", "/api/tags"),
                            ("running", "/api/ps")):
             try:
-                r = requests.get(f"{base}{path}", timeout=5)
+                r = self.scope.request("GET", f"{base}{path}", timeout=5)
                 out[name] = r.json() if r.status_code == 200 else f"HTTP {r.status_code}"
             except Exception as e:
                 out[name] = f"ERR: {e}"
@@ -501,7 +552,7 @@ class ReconKit:
     def header_audit(self, url: str) -> dict:
         self.scope.assert_in_scope(_host_of(url))
         try:
-            r = requests.get(url, timeout=5, verify=False, allow_redirects=True)
+            r = self.scope.request("GET", url, timeout=5, allow_redirects=False)
         except requests.RequestException as e:
             return {"error": str(e)}
         h = r.headers
@@ -521,7 +572,7 @@ class ReconKit:
         self.scope.assert_in_scope(_host_of(url))
         risky = {"PUT", "DELETE", "TRACE", "CONNECT", "PATCH"}
         try:
-            r = requests.options(url, timeout=5, verify=False)
+            r = self.scope.request("OPTIONS", url, timeout=5)
         except requests.RequestException as e:
             return {"error": str(e)}
         methods = [m.strip() for m in r.headers.get("Allow", "").split(",") if m.strip()]
@@ -537,7 +588,7 @@ class ReconKit:
         base = url.rstrip("/")
         out = {"robots": [], "sitemaps": []}
         try:
-            r = requests.get(f"{base}/robots.txt", timeout=5)
+            r = self.scope.request("GET", f"{base}/robots.txt", timeout=5)
             if r.status_code == 200:
                 for line in r.text.splitlines():
                     line = line.strip()
@@ -583,13 +634,13 @@ class ReconKit:
         # HTTP-ish ports: pull Server header + fingerprint
         if port in (80, 8080, 11434) or svc.startswith("http"):
             try:
-                r = requests.get(f"http://{host}:{port}", timeout=4)
+                r = self.scope.request("GET", f"http://{host}:{port}", timeout=4)
                 out["version"] = r.headers.get("Server") or None
                 out["extra"]["status"] = r.status_code
                 out["extra"]["content_type"] = r.headers.get("Content-Type", "")
                 # Ollama self-IDs via /api/version
                 if port == 11434:
-                    v = requests.get(f"http://{host}:{port}/api/version", timeout=4)
+                    v = self.scope.request("GET", f"http://{host}:{port}/api/version", timeout=4)
                     if v.status_code == 200:
                         out["version"] = f"Ollama {v.json().get('version','?')}"
             except Exception as e:
@@ -600,7 +651,7 @@ class ReconKit:
             out["version"] = "TLS"
             out["extra"]["cert_subject"] = cert.get("subject")
             try:
-                r = requests.get(f"https://{host}:{port}", timeout=4, verify=False)
+                r = self.scope.request("GET", f"https://{host}:{port}", timeout=4)
                 out["version"] = r.headers.get("Server") or "TLS"
                 out["extra"]["status"] = r.status_code
             except Exception:
@@ -815,6 +866,7 @@ class LLMTarget:
     def __init__(self, url: str, scope: Scope, api_type: str = "auto",
                  model: str = "mistral:7b", headers: Optional[dict] = None,
                  system_prompt: str = ""):
+        self.scope = scope
         self.url = url.rstrip("/")
         scope.assert_in_scope(_host_of(self.url))
         self.model = model
@@ -842,14 +894,14 @@ class LLMTarget:
         if self.system_prompt:
             payload["system"] = self.system_prompt
         try:
-            r = requests.post(f"{self.url}/api/generate", json=payload, timeout=30)
+            r = self.scope.request("POST", f"{self.url}/api/generate", json=payload, timeout=30)
             return r.json().get("response", f"ERROR: HTTP {r.status_code}")
         except Exception as e:
             return f"ERROR: {e}"
 
     def _ask_openai(self, prompt: str) -> str:
         try:
-            r = requests.post(f"{self.url}/chat/completions", headers=self.headers,
+            r = self.scope.request("POST", f"{self.url}/chat/completions", headers=self.headers,
                               json={"model": self.model,
                                     "messages": [{"role": "user", "content": prompt}]},
                               timeout=30)
