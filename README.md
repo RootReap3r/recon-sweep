@@ -207,3 +207,11 @@ capability; recon-sweep is where they were first shown to hold.
 
 Think Anakin before the suit — same instincts, earlier form. Everything
 Nemesis does at scale, recon-sweep did first as a single-file harness.
+
+## HTTP scope enforcement
+
+All scanner and target HTTP calls now use `Scope.request`. It validates HTTP(S) URLs, rejects URL credentials, resolves and checks all address answers against the allowlist, and connects to a pinned approved IP while preserving the original Host header and TLS hostname verification. Ambient proxies and netrc authentication are disabled. Automatic redirects are disabled even if requested by a caller. Inspect a redirect destination and add it to the authorized scope before scanning it explicitly.
+
+HTTPS requests verify certificates. The separate TLS-certificate inspection routine remains a diagnostic for inspecting target certificates. This change covers HTTP routing; it is not a claim that every raw-socket scanner has been redesigned.
+
+Regression checks: `python -m pip install requests` then `python -m unittest discover -s tests -v`. Tests use a loopback HTTP server and mocked DNS/transport, never an external target.
